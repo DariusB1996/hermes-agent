@@ -636,6 +636,10 @@ export function handleMouseEvent(app: App, m: ParsedMouse): void {
       app.clickCount = 0
 
       if (baseButton === 2 && hasSelection(sel)) {
+        if ((m.button & 0x20) !== 0) {
+          return
+        }
+
         void app.props
           .onCopySelectionNoClear()
           .then(text => {

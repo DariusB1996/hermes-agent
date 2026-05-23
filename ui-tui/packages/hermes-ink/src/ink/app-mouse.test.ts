@@ -52,6 +52,18 @@ describe('handleMouseEvent right-click selection behavior', () => {
     expect(app.props.onMouseDownAt).toHaveBeenCalledWith(2, 0, 2)
   })
 
+  it('does not repeatedly copy or paste during right-button motion events over a selection', () => {
+    const app = makeApp()
+
+    startSelection(app.props.selection, 0, 0)
+    updateSelection(app.props.selection, 4, 0)
+
+    handleMouseEvent(app, { action: 'press', button: 0x20 | 2, col: 3, kind: 'mouse', row: 1 })
+
+    expect(app.props.onCopySelectionNoClear).not.toHaveBeenCalled()
+    expect(app.props.onMouseDownAt).not.toHaveBeenCalled()
+  })
+
   it('still dispatches right-click handlers when no text is selected', () => {
     const app = makeApp()
 
