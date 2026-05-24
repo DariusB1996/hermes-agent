@@ -3907,11 +3907,16 @@ def resolve_vision_provider_client(
                 # an image would produce a cryptic provider-side error like
                 # ``unknown variant `image_url`, expected `text``` (#31179).
                 # Fall through to the aggregator chain instead.
+                #
+                # Only log the provider name (not the model) — mirrors the
+                # sibling _PROVIDERS_WITHOUT_VISION branch above, and avoids
+                # CodeQL py/clear-text-logging-sensitive-data heuristic false
+                # positives on multi-value interpolations.
                 logger.debug(
-                    "Vision auto-detect: skipping main provider %s (%s "
-                    "reports no vision capability) — falling through to "
+                    "Vision auto-detect: skipping main provider %s "
+                    "(reports no vision capability) — falling through to "
                     "aggregator chain",
-                    main_provider, vision_model,
+                    main_provider,
                 )
             else:
                 rpc_client, rpc_model = resolve_provider_client(
