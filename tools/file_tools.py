@@ -205,6 +205,19 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
     return get_cross_profile_warning(resolved)
 
 
+def _check_upstream_managed_skill_path(filepath: str, task_id: str = "default") -> str | None:
+    """Return a hard-deny error for bundled/default or Hub skill writes."""
+    try:
+        from agent.file_safety import get_upstream_managed_skill_write_error
+    except Exception:
+        return None
+    try:
+        resolved = str(_resolve_path_for_task(filepath, task_id))
+    except (OSError, ValueError):
+        resolved = filepath
+    return get_upstream_managed_skill_write_error(resolved)
+
+
 def _is_expected_write_exception(exc: Exception) -> bool:
     """Return True for expected write denials that should not hit error logs."""
     if isinstance(exc, PermissionError):
@@ -836,6 +849,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    upstream_skill_err = _check_upstream_managed_skill_path(path, task_id)
+    if upstream_skill_err:
+        return tool_error(upstream_skill_err)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -913,6 +929,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
             _paths_to_check.append(_m.group(1).strip())
     for _p in _paths_to_check:
+        upstream_skill_err = _check_upstream_managed_skill_path(_p, task_id)
+        if upstream_skill_err:
+            return tool_error(upstream_skill_err)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)

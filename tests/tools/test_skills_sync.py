@@ -681,6 +681,35 @@ class TestResetBundledSkill:
         # SKILL.md should be the bundled content
         assert "GW v2 (upstream)" in (dest / "SKILL.md").read_text()
 
+    def test_reset_restore_removes_legacy_duplicate_copy(self, tmp_path):
+        """--restore removes every installed copy with the bundled skill name."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+
+        canonical = skills_dir / "productivity" / "google-workspace"
+        canonical.mkdir(parents=True)
+        (canonical / "SKILL.md").write_text("---\nname: google-workspace\n---\n# drifted canonical\n")
+
+        legacy = skills_dir / "google-workspace"
+        legacy.mkdir(parents=True)
+        (legacy / "SKILL.md").write_text("---\nname: google-workspace\n---\n# drifted legacy\n")
+        (legacy / "notes.md").write_text("legacy overlay\n")
+        manifest_file.write_text("google-workspace:STALEHASH000000000000000000000000\n")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = reset_bundled_skill("google-workspace", restore=True)
+            manifest_after = _read_manifest()
+            expected = _dir_hash(bundled / "productivity" / "google-workspace")
+
+        assert result["ok"] is True
+        assert result["action"] == "restored"
+        assert "Removed 2 installed copy/copies" in result["message"]
+        assert canonical.exists()
+        assert "GW v2 (upstream)" in (canonical / "SKILL.md").read_text()
+        assert not legacy.exists()
+        assert manifest_after["google-workspace"] == expected
+
     def test_reset_nonexistent_skill_errors_gracefully(self, tmp_path):
         """Resetting a skill that's neither bundled nor in the manifest returns a clear error."""
         bundled = self._setup_bundled(tmp_path)

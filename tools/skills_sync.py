@@ -158,6 +158,43 @@ def _compute_relative_dest(skill_dir: Path, bundled_dir: Path) -> Path:
     return SKILLS_DIR / rel
 
 
+def _installed_skill_dirs_for_name(name: str) -> List[Path]:
+    """Return installed skill directories in SKILLS_DIR whose frontmatter name matches *name*.
+
+    Older Hermes installs and profile overlays can contain legacy duplicate
+    copies of a bundled skill at non-canonical paths (for example both
+    ``skills/ideation`` and ``skills/creative/ideation``). ``reset --restore``
+    must remove all copies with the bundled skill name, not just the current
+    canonical destination, otherwise stale overlays keep shadowing the restored
+    bundled version.
+    """
+    if not name or not SKILLS_DIR.exists():
+        return []
+
+    result: list[Path] = []
+    seen: set[Path] = set()
+    try:
+        skill_mds = SKILLS_DIR.rglob("SKILL.md")
+    except OSError:
+        return []
+    for skill_md in skill_mds:
+        if is_excluded_skill_path(skill_md):
+            continue
+        skill_dir = skill_md.parent
+        skill_name = _read_skill_name(skill_md, skill_dir.name)
+        if skill_name != name:
+            continue
+        try:
+            resolved = skill_dir.resolve()
+        except (OSError, RuntimeError):
+            resolved = skill_dir
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        result.append(skill_dir)
+    return result
+
+
 def _dir_hash(directory: Path) -> str:
     """Compute a hash of all file contents in a directory for change detection."""
     hasher = hashlib.md5()
@@ -364,8 +401,13 @@ def reset_bundled_skill(name: str, restore: bool = False) -> dict:
         del manifest[name]
         _write_manifest(manifest)
 
-    # Step 2 (optional): delete the user's copy so next sync re-copies bundled
+    # Step 2 (optional): delete every installed copy with this bundled skill
+    # name so next sync re-copies exactly the canonical bundled path. Older
+    # Hermes homes can contain stale flat/profile-overlay copies with the same
+    # frontmatter name; deleting only the canonical destination leaves those
+    # shadows alive and makes the reset look successful while drift remains.
     deleted_user_copy = False
+    deleted_paths: list[str] = []
     if restore:
         if not is_bundled:
             return {
@@ -379,17 +421,23 @@ def reset_bundled_skill(name: str, restore: bool = False) -> dict:
             }
         # The destination mirrors the bundled path relative to bundled_dir.
         dest = _compute_relative_dest(bundled_by_name[name], bundled_dir)
-        if dest.exists():
+        install_dirs = _installed_skill_dirs_for_name(name)
+        if dest.exists() and dest not in install_dirs:
+            install_dirs.append(dest)
+        for skill_dir in install_dirs:
+            if not skill_dir.exists():
+                continue
             try:
-                shutil.rmtree(dest)
+                shutil.rmtree(skill_dir)
                 deleted_user_copy = True
+                deleted_paths.append(str(skill_dir))
             except (OSError, IOError) as e:
                 return {
                     "ok": False,
                     "action": "manifest_cleared",
                     "message": (
                         f"Cleared manifest entry for '{name}' but could not "
-                        f"delete user copy at {dest}: {e}"
+                        f"delete user copy at {skill_dir}: {e}"
                     ),
                     "synced": None,
                 }
@@ -399,7 +447,7 @@ def reset_bundled_skill(name: str, restore: bool = False) -> dict:
 
     if restore and deleted_user_copy:
         action = "restored"
-        message = f"Restored '{name}' from bundled source."
+        message = f"Restored '{name}' from bundled source. Removed {len(deleted_paths)} installed copy/copies."
     elif restore:
         # Nothing on disk to delete, but we re-synced — acts like a fresh install
         action = "restored"

@@ -2,10 +2,11 @@
 """
 Skill Manager Tool -- Agent-Managed Skill Creation & Editing
 
-Allows the agent to create, update, and delete skills, turning successful
-approaches into reusable procedural knowledge. New skills are created in
-~/.hermes/skills/. Existing skills (bundled, hub-installed, or user-created)
-can be modified or deleted wherever they live.
+Allows the agent to create user-owned skills and update non-upstream skills.
+Bundled/default and Skills Hub-installed skills are immutable for agents: they
+are maintained by upstream sync/reset commands, not by skill_manage edits.
+New skills are created in ~/.hermes/skills/. Existing user-created skills can be
+modified or deleted wherever they live.
 
 Skills are the agent's procedural memory: they capture *how to do a specific
 type of task* based on proven experience. General memory (MEMORY.md, USER.md) is
@@ -158,6 +159,40 @@ def _pinned_guard(name: str) -> Optional[str]:
             )
     except Exception:
         logger.debug("pinned-guard lookup failed for %s", name, exc_info=True)
+    return None
+
+
+def _upstream_managed_name_guard(name: str) -> Optional[str]:
+    """Return a refusal when *name* is reserved by bundled/default or Hub skills."""
+    try:
+        from agent.file_safety import is_upstream_managed_skill_name
+        if is_upstream_managed_skill_name(name):
+            return (
+                f"Skill name '{name}' is reserved by a bundled/default or "
+                "Skills Hub-installed Hermes skill. "
+                "Agents and workers must not create, shadow, edit, patch, or "
+                "delete upstream-managed skills directly. Create a distinct "
+                "companion skill name instead, or put Darius-specific behavior "
+                "in AGENTS.md, project .hermes.md, memory, or a Kanban Worker "
+                "Goal Prompt."
+            )
+    except Exception:
+        logger.debug("upstream-managed name guard failed for %s", name, exc_info=True)
+    return None
+
+
+def _upstream_managed_skill_guard(name: str, skill_dir: Path, action: str) -> Optional[str]:
+    """Return a hard-deny error for mutating bundled/default or Hub skills."""
+    name_err = _upstream_managed_name_guard(name)
+    if name_err:
+        return f"Refusing skill_manage(action='{action}', name='{name}'): {name_err}"
+    try:
+        from agent.file_safety import get_upstream_managed_skill_write_error
+        err = get_upstream_managed_skill_write_error(str(skill_dir / "SKILL.md"))
+        if err:
+            return f"Refusing skill_manage(action='{action}', name='{name}'): {err}"
+    except Exception:
+        logger.debug("upstream-managed skill guard failed for %s", name, exc_info=True)
     return None
 
 
@@ -493,6 +528,10 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if err:
         return {"success": False, "error": err}
 
+    err = _upstream_managed_name_guard(name)
+    if err:
+        return {"success": False, "error": err}
+
     # Check for name collisions across all directories
     existing = _find_skill(name)
     if existing:
@@ -544,6 +583,10 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
 
+    upstream_err = _upstream_managed_skill_guard(name, existing["path"], "edit")
+    if upstream_err:
+        return {"success": False, "error": upstream_err}
+
     skill_md = existing["path"] / "SKILL.md"
     # Back up original content for rollback
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
@@ -585,6 +628,9 @@ def _patch_skill(
         return {"success": False, "error": _skill_not_found_error(name)}
 
     skill_dir = existing["path"]
+    upstream_err = _upstream_managed_skill_guard(name, skill_dir, "patch")
+    if upstream_err:
+        return {"success": False, "error": upstream_err}
 
     if file_path:
         # Patching a supporting file
@@ -696,6 +742,10 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
             }
 
     skill_dir = existing["path"]
+    upstream_err = _upstream_managed_skill_guard(name, skill_dir, "delete")
+    if upstream_err:
+        return {"success": False, "error": upstream_err}
+
     skills_root = _containing_skills_root(skill_dir)
     shutil.rmtree(skill_dir)
 
@@ -742,6 +792,10 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name, " Create it first with action='create'.")}
 
+    upstream_err = _upstream_managed_skill_guard(name, existing["path"], "write_file")
+    if upstream_err:
+        return {"success": False, "error": upstream_err}
+
     target, err = _resolve_skill_target(existing["path"], file_path)
     if err:
         return {"success": False, "error": err}
@@ -777,6 +831,9 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
         return {"success": False, "error": _skill_not_found_error(name)}
 
     skill_dir = existing["path"]
+    upstream_err = _upstream_managed_skill_guard(name, skill_dir, "remove_file")
+    if upstream_err:
+        return {"success": False, "error": upstream_err}
 
     target, err = _resolve_skill_target(skill_dir, file_path)
     if err:
@@ -902,7 +959,11 @@ SKILL_MANAGE_SCHEMA = {
     "description": (
         "Manage skills (create, update, delete). Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
-        f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
+        f"New skills go to {display_hermes_home()}/skills/. Bundled/default "
+        "and Skills Hub-installed skills are upstream-managed and immutable: "
+        "skill_manage refuses to create, shadow, patch, edit, write support "
+        "files into, remove files from, or delete them. Use a distinct "
+        "companion skill name for local extensions.\n\n"
         "Actions: create (full SKILL.md + optional category), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "

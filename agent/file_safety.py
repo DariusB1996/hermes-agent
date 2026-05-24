@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -133,6 +136,441 @@ def is_write_denied(path: str) -> bool:
         return True
 
     return False
+
+
+# ---------------------------------------------------------------------------
+# Upstream-managed skill immutability
+#
+# Bundled/default and Skills Hub-installed skills are upstream artifacts. They
+# are synced/reset by Hermes maintenance commands, not edited by agents. This
+# guard is intentionally hard for file tools and skill_manage: cross_profile=True
+# does not bypass it. Runtime shell access is still not a security boundary, but
+# every native Hermes write path must refuse these targets.
+# ---------------------------------------------------------------------------
+
+_EXCLUDED_SKILL_PATH_PARTS = frozenset(
+    (
+        ".git",
+        ".github",
+        ".hub",
+        ".archive",
+        ".venv",
+        "venv",
+        "node_modules",
+        "site-packages",
+        "__pycache__",
+        ".tox",
+        ".nox",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+    )
+)
+
+
+def _skill_path_excluded(path: Path) -> bool:
+    return any(part in _EXCLUDED_SKILL_PATH_PARTS for part in path.parts)
+
+
+def _read_skill_name_from_md(skill_md: Path, fallback: str) -> str:
+    """Read a skill name from SKILL.md frontmatter with a safe fallback."""
+    try:
+        content = skill_md.read_text(encoding="utf-8", errors="replace")[:4000]
+    except OSError:
+        return fallback
+    in_frontmatter = False
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if stripped == "---":
+            if in_frontmatter:
+                break
+            in_frontmatter = True
+            continue
+        if in_frontmatter and stripped.startswith("name:"):
+            value = stripped.split(":", 1)[1].strip().strip("\"'")
+            if value:
+                return value
+    return fallback
+
+
+@lru_cache(maxsize=1)
+def _current_bundled_skill_names() -> frozenset[str]:
+    """Return names currently shipped as bundled Hermes skills."""
+    try:
+        from hermes_constants import get_bundled_skills_dir
+        default = Path(__file__).resolve().parent.parent / "skills"
+        bundled_dir = get_bundled_skills_dir(default)
+    except Exception:
+        return frozenset()
+    names: set[str] = set()
+    try:
+        for skill_md in bundled_dir.rglob("SKILL.md"):
+            if _skill_path_excluded(skill_md):
+                continue
+            names.add(_read_skill_name_from_md(skill_md, fallback=skill_md.parent.name))
+    except OSError:
+        return frozenset(names)
+    return frozenset(names)
+
+
+def _upstream_managed_skill_names() -> set[str]:
+    """Return skill names reserved by bundled/default manifests or Hub locks.
+
+    This intentionally looks at every runtime/profile skills root, not just the
+    current bundled source tree. Hub-installed skills can be deleted from disk
+    while still being present in ``.hub/lock.json``; their names must remain
+    reserved so agents cannot silently recreate/shadow them as local skills.
+    """
+    names: set[str] = set(_current_bundled_skill_names())
+    for skills_root, _root_type in _skill_roots_for_immutability_guard():
+        names.update(_read_bundled_manifest_names(skills_root))
+        hub_names, _hub_paths = _read_hub_installed(skills_root)
+        names.update(hub_names)
+    return names
+
+
+def is_upstream_managed_skill_name(name: str) -> bool:
+    """True when *name* is reserved by a bundled/default or Hub skill."""
+    return bool(name) and name in _upstream_managed_skill_names()
+
+
+def _read_bundled_manifest_names(skills_root: Path) -> set[str]:
+    manifest = skills_root / ".bundled_manifest"
+    if not manifest.exists():
+        return set()
+    names: set[str] = set()
+    try:
+        for line in manifest.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            name = line.split(":", 1)[0].strip()
+            if name:
+                names.add(name)
+    except OSError:
+        pass
+    return names
+
+
+def _read_hub_installed(skills_root: Path) -> tuple[set[str], set[Path]]:
+    lock_path = skills_root / ".hub" / "lock.json"
+    if not lock_path.exists():
+        return set(), set()
+    names: set[str] = set()
+    paths: set[Path] = set()
+    try:
+        data = json.loads(lock_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return names, paths
+    installed = data.get("installed") if isinstance(data, dict) else None
+    if not isinstance(installed, dict):
+        return names, paths
+    for key, entry in installed.items():
+        if key:
+            names.add(str(key))
+        if not isinstance(entry, dict):
+            continue
+        install_path = entry.get("install_path")
+        if not isinstance(install_path, str) or not install_path.strip():
+            continue
+        skill_dir = Path(install_path)
+        if not skill_dir.is_absolute():
+            skill_dir = skills_root / skill_dir
+        try:
+            resolved = skill_dir.resolve()
+            resolved.relative_to(skills_root.resolve())
+        except (OSError, RuntimeError, ValueError):
+            continue
+        paths.add(resolved)
+        skill_md = resolved / "SKILL.md"
+        if skill_md.exists():
+            names.add(_read_skill_name_from_md(skill_md, fallback=resolved.name))
+    return names, paths
+
+
+def _bundled_source_root() -> Optional[Path]:
+    try:
+        from hermes_constants import get_bundled_skills_dir
+        default = Path(__file__).resolve().parent.parent / "skills"
+        return get_bundled_skills_dir(default).resolve()
+    except Exception:
+        return None
+
+
+def _skill_roots_for_immutability_guard() -> list[tuple[Path, str]]:
+    """Return runtime/profile skill roots plus the bundled source tree."""
+    roots: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+
+    def add(path: Path, root_type: str) -> None:
+        try:
+            real = path.resolve()
+        except (OSError, RuntimeError):
+            real = path
+        if real in seen:
+            return
+        seen.add(real)
+        roots.append((real, root_type))
+
+    for base in (_hermes_home_path(), _hermes_root_path()):
+        add(base / "skills", "runtime")
+
+    profiles_dir = _hermes_root_path() / "profiles"
+    if profiles_dir.is_dir():
+        try:
+            for entry in profiles_dir.iterdir():
+                if entry.is_dir():
+                    add(entry / "skills", "runtime")
+        except OSError:
+            pass
+
+    bundled = _bundled_source_root()
+    if bundled is not None:
+        add(bundled, "bundled-source")
+    return roots
+
+
+def _candidate_skill_dir_for_path(target: Path, skills_root: Path) -> Optional[Path]:
+    try:
+        rel = target.relative_to(skills_root)
+    except ValueError:
+        return None
+    if not rel.parts or rel.parts[0] in _EXCLUDED_SKILL_PATH_PARTS:
+        return None
+
+    # Existing skill: ascend until the nearest directory containing SKILL.md.
+    cursor = target if target.is_dir() else target.parent
+    try:
+        cursor.relative_to(skills_root)
+    except ValueError:
+        return None
+    while cursor != skills_root and skills_root in cursor.parents:
+        if (cursor / "SKILL.md").exists():
+            return cursor
+        cursor = cursor.parent
+
+    # New/overwritten SKILL.md: parent directory is the intended skill dir.
+    if target.name == "SKILL.md":
+        return target.parent
+
+    # Supporting file under a missing skill dir. Handle both category/skill/*
+    # and flat skill/* layouts defensively.
+    if len(rel.parts) >= 3:
+        return skills_root / rel.parts[0] / rel.parts[1]
+    if len(rel.parts) >= 2:
+        return skills_root / rel.parts[0]
+    return None
+
+
+def classify_upstream_managed_skill_target(path: str) -> Optional[dict]:
+    """Classify *path* if it targets a bundled/default or hub skill.
+
+    Returns None when the path is not under a known protected skill. Otherwise
+    returns source/path/name metadata suitable for a user-facing denial.
+    """
+    try:
+        target = Path(os.path.expanduser(str(path))).resolve()
+    except (OSError, RuntimeError):
+        return None
+
+    bundled_names = _current_bundled_skill_names()
+    for skills_root, root_type in _skill_roots_for_immutability_guard():
+        try:
+            target.relative_to(skills_root)
+        except ValueError:
+            continue
+        skill_dir = _candidate_skill_dir_for_path(target, skills_root)
+        if skill_dir is None or _skill_path_excluded(skill_dir):
+            return None
+        skill_md = skill_dir / "SKILL.md"
+        name = _read_skill_name_from_md(skill_md, fallback=skill_dir.name) if skill_md.exists() else skill_dir.name
+        candidate_names = {name, skill_dir.name}
+
+        sources: list[str] = []
+        manifest_names = _read_bundled_manifest_names(skills_root)
+        if root_type == "bundled-source":
+            sources.append("bundled-source")
+        if candidate_names & (set(bundled_names) | manifest_names):
+            sources.append("bundled")
+        hub_names, hub_paths = _read_hub_installed(skills_root)
+        try:
+            skill_real = skill_dir.resolve()
+        except (OSError, RuntimeError):
+            skill_real = skill_dir
+        if candidate_names & hub_names or skill_real in hub_paths:
+            sources.append("hub")
+        if not sources:
+            return None
+        return {
+            "name": name,
+            "source": "+".join(sorted(set(sources))),
+            "skill_dir": str(skill_real),
+            "target_path": str(target),
+            "skills_root": str(skills_root),
+        }
+    return None
+
+
+def get_upstream_managed_skill_write_error(path: str) -> Optional[str]:
+    info = classify_upstream_managed_skill_target(path)
+    if info is None:
+        return None
+    return (
+        f"Upstream-managed skill write blocked: {info['target_path']} targets "
+        f"skill {info['name']!r} ({info['source']}) at {info['skill_dir']}. "
+        "Bundled/default and Skills Hub-installed skills are immutable for "
+        "agents and workers. Put Darius-specific behavior in AGENTS.md, "
+        "project .hermes.md, memory, Kanban Worker Goal Prompts, or a separate "
+        "companion skill with a distinct name. To discard existing drift for a "
+        "bundled skill, use `hermes skills reset <name> --restore`; do not edit "
+        "the upstream-managed skill directly."
+    )
+
+
+_UPSTREAM_SKILL_MUTATION_RE = re.compile(
+    r"(?is)("
+    r">>|>\s*|"
+    r"\b(?:rm|mv|cp|install|rsync|tee|touch|mkdir|chmod|chown)\b|"
+    r"\bsed\s+-[^\s;|&]*i\b|\bperl\s+-[^\s;|&]*i\b|"
+    r"\b(?:tar|gtar)\b[^\n;|&]*\b(?:-x|--extract)\b|\bunzip\b|"
+    r"write_text\s*\(|write_bytes\s*\(|\.write\s*\(|"
+    r"open\s*\([^\n]{0,240}['\"](?:w|a|x|r\+|w\+|a\+|x\+)['\"]|"
+    r"unlink\s*\(|rmdir\s*\(|rmtree\s*\(|"
+    r"shutil\.(?:copy|copy2|copyfile|copytree|move|rmtree)\s*\("
+    r")"
+)
+
+
+def _command_path_variants(path: Path) -> set[str]:
+    variants = {str(path)}
+    try:
+        home = Path.home().resolve()
+        resolved = path.resolve()
+        rel = resolved.relative_to(home)
+        rel_s = str(rel)
+        variants.update({
+            f"~/{rel_s}",
+            f"$HOME/{rel_s}",
+            f"${{HOME}}/{rel_s}",
+        })
+    except (OSError, RuntimeError, ValueError):
+        pass
+
+    try:
+        hermes_home = _hermes_home_path().resolve()
+        resolved = path.resolve()
+        rel = resolved.relative_to(hermes_home)
+        rel_s = str(rel)
+        variants.update({
+            f"$HERMES_HOME/{rel_s}",
+            f"${{HERMES_HOME}}/{rel_s}",
+        })
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return {v for v in variants if v}
+
+
+def _protected_skill_dirs_for_commands() -> dict[str, str]:
+    """Return command-string path fragments for known protected skill dirs.
+
+    The command backstop must be narrower than ``$HERMES_HOME/skills``. A broad
+    root match blocks legitimate creation of custom skills. Instead, collect the
+    concrete protected skill directories that currently exist plus Hub lock
+    install paths. Name-only reservations are handled separately by the regex in
+    ``get_upstream_managed_skill_command_error``.
+    """
+    protected: dict[str, str] = {}
+    reserved_names = _upstream_managed_skill_names()
+    for root, root_type in _skill_roots_for_immutability_guard():
+        hub_names, hub_paths = _read_hub_installed(root)
+
+        for hub_path in hub_paths:
+            name = hub_path.name
+            skill_md = hub_path / "SKILL.md"
+            if skill_md.exists():
+                name = _read_skill_name_from_md(skill_md, fallback=hub_path.name)
+            for variant in _command_path_variants(hub_path):
+                protected[variant] = name
+
+        if root_type == "bundled-source":
+            # The bundled source tree itself is upstream-managed; every skill in
+            # it is protected even before it has been copied into a runtime root.
+            candidate_names = reserved_names or _current_bundled_skill_names()
+        else:
+            candidate_names = reserved_names | hub_names | _read_bundled_manifest_names(root)
+
+        if not root.exists():
+            continue
+        try:
+            skill_mds = root.rglob("SKILL.md")
+        except OSError:
+            continue
+        for skill_md in skill_mds:
+            if _skill_path_excluded(skill_md):
+                continue
+            skill_dir = skill_md.parent
+            name = _read_skill_name_from_md(skill_md, fallback=skill_dir.name)
+            if name not in candidate_names and skill_dir.name not in candidate_names:
+                continue
+            for variant in _command_path_variants(skill_dir):
+                protected[variant] = name
+    return protected
+
+
+def _command_references_reserved_skill_name(command: str, reserved_names: set[str]) -> Optional[str]:
+    """Return a reserved skill name if *command* targets it under a skills dir."""
+    if not reserved_names:
+        return None
+    for name in sorted(reserved_names, key=len, reverse=True):
+        # Match paths like:
+        #   $HERMES_HOME/skills/category/name/SKILL.md
+        #   ~/.hermes/profiles/reviewer/skills/name/SKILL.md
+        #   /tmp/hermes/skills/category/subcategory/name/templates/x.md
+        pattern = re.compile(
+            r"(?<![\w.-])(?:~|\$HOME|\$\{HOME\}|\$HERMES_HOME|\$\{HERMES_HOME\}|/[^\s'\";|&]+)"
+            r"(?:/profiles/[^/\s'\";|&]+)?/skills/(?:[^/\s'\";|&]+/)*"
+            + re.escape(name)
+            + r"(?:/|(?=[\s'\";|&]|$))"
+        )
+        if pattern.search(command):
+            return name
+    return None
+
+
+def get_upstream_managed_skill_command_error(command: str) -> Optional[str]:
+    """Return a hard-deny message for shell/code that mutates upstream skills.
+
+    This is a best-effort pre-exec backstop for terminal/execute_code. The
+    authoritative guard remains path-based in write_file/patch/skill_manage;
+    this catches common shell/Python write attempts that bypass those tools.
+    """
+    if not isinstance(command, str) or "skill" not in command.lower():
+        return None
+    if not _UPSTREAM_SKILL_MUTATION_RE.search(command):
+        return None
+
+    protected_dirs = _protected_skill_dirs_for_commands()
+    matched = None
+    matched_name = None
+    for fragment, name in sorted(protected_dirs.items(), key=lambda item: len(item[0]), reverse=True):
+        if fragment and fragment in command:
+            matched = fragment
+            matched_name = name
+            break
+
+    if matched is None:
+        matched_name = _command_references_reserved_skill_name(command, _upstream_managed_skill_names())
+        if matched_name:
+            matched = matched_name
+
+    if matched is None:
+        return None
+    return (
+        "Upstream-managed skill mutation blocked before execution: command/code "
+        f"references protected skill path/name {matched!r} ({matched_name}) and contains a write/delete "
+        "operation. Bundled/default and Skills Hub-installed skills must be "
+        "changed only through upstream sync/reset paths, never by agents/workers."
+    )
 
 
 def get_read_block_error(path: str) -> Optional[str]:

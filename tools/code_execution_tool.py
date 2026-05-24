@@ -1063,6 +1063,14 @@ def execute_code(
     if not code or not code.strip():
         return tool_error("No code provided.")
 
+    try:
+        from agent.file_safety import get_upstream_managed_skill_command_error
+        upstream_skill_error = get_upstream_managed_skill_command_error(code)
+    except Exception:
+        upstream_skill_error = None
+    if upstream_skill_error:
+        return tool_error(f"BLOCKED (hardline): {upstream_skill_error}")
+
     # Dispatch: remote backends use file-based RPC, local uses UDS
     from tools.terminal_tool import _get_env_config
     env_type = _get_env_config()["env_type"]

@@ -1073,6 +1073,23 @@ def check_all_command_guards(command: str, env_type: str,
                        sudo_guess_desc, command[:200])
         return _sudo_stdin_block_result(sudo_guess_desc)
 
+    # Upstream-managed skill guard: agents/workers must not mutate bundled
+    # default or Skills Hub-installed skills through shell commands. This is a
+    # hard floor before yolo/mode=off so no approval mode can bypass it.
+    try:
+        from agent.file_safety import get_upstream_managed_skill_command_error
+        upstream_skill_error = get_upstream_managed_skill_command_error(command)
+    except Exception:
+        upstream_skill_error = None
+    if upstream_skill_error:
+        logger.warning("Upstream skill mutation block: %s (command: %s)",
+                       upstream_skill_error, command[:200])
+        return {
+            "approved": False,
+            "hardline": True,
+            "message": f"BLOCKED (hardline): {upstream_skill_error}",
+        }
+
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
