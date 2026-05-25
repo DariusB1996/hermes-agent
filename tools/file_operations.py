@@ -37,6 +37,7 @@ from tools.binary_extensions import BINARY_EXTENSIONS
 from agent.file_safety import (
     build_write_denied_paths,
     build_write_denied_prefixes,
+    get_protected_skill_content_error as _shared_get_protected_skill_content_error,
     get_safe_write_root as _shared_get_safe_write_root,
     is_write_denied as _shared_is_write_denied,
 )
@@ -946,6 +947,13 @@ class ShellFileOperations(FileOperations):
         # Block writes to sensitive paths
         if _is_write_denied(path):
             return WriteResult(error=f"Write denied: '{path}' is a protected system/credential file.")
+        protected_content_error = _shared_get_protected_skill_content_error(
+            path,
+            content,
+            action="write",
+        )
+        if protected_content_error:
+            return WriteResult(error=protected_content_error)
 
         # Capture pre-write content.  Two consumers want it:
         #

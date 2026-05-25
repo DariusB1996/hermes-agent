@@ -836,6 +836,97 @@ class TestExternalSkillMutations:
         assert not (external / "fresh-skill").exists()
 
 
+# ---------------------------------------------------------------------------
+# Protected upstream skills — bundled/default and hub-installed skills are
+# upstream artifacts. skill_manage must not mutate them in place.
+# ---------------------------------------------------------------------------
+
+
+def _write_named_skill(skills_root: Path, name: str) -> Path:
+    skill_dir = skills_root / name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: Protected test skill.\n---\n\n"
+        "# Protected\n\nBody with OLD_MARKER.\n",
+        encoding="utf-8",
+    )
+    return skill_dir
+
+
+def _updated_skill_content(name: str) -> str:
+    return (
+        f"---\nname: {name}\ndescription: Updated.\n---\n\n"
+        "# Updated\n\nNew body.\n"
+    )
+
+
+class TestProtectedSkillGuard:
+    @staticmethod
+    def _mark_bundled(skills_root: Path, name: str) -> None:
+        (skills_root / ".bundled_manifest").write_text(f"{name}:abc123\n", encoding="utf-8")
+
+    @staticmethod
+    def _mark_hub(skills_root: Path, name: str) -> None:
+        hub_dir = skills_root / ".hub"
+        hub_dir.mkdir()
+        (hub_dir / "lock.json").write_text(
+            json.dumps({"version": 1, "installed": {name: {"install_path": name}}}),
+            encoding="utf-8",
+        )
+
+    @pytest.mark.parametrize("operation", ["edit", "patch", "write_file", "remove_file", "delete"])
+    def test_bundled_skill_mutations_are_refused(self, tmp_path, operation):
+        name = "protected-skill"
+        skill_dir = _write_named_skill(tmp_path, name)
+        self._mark_bundled(tmp_path, name)
+        support_file = skill_dir / "references" / "notes.md"
+        support_file.parent.mkdir()
+        support_file.write_text("OLD_MARKER", encoding="utf-8")
+
+        with _skill_dir(tmp_path):
+            if operation == "edit":
+                result = _edit_skill(name, _updated_skill_content(name))
+            elif operation == "patch":
+                result = _patch_skill(name, "OLD_MARKER", "NEW_MARKER")
+            elif operation == "write_file":
+                result = _write_file(name, "references/new.md", "new content")
+            elif operation == "remove_file":
+                result = _remove_file(name, "references/notes.md")
+            elif operation == "delete":
+                result = _delete_skill(name)
+            else:  # pragma: no cover - parametrization guard
+                raise AssertionError(operation)
+
+        assert result["success"] is False, result
+        assert "protected skill" in result["error"].lower()
+        assert (skill_dir / "SKILL.md").exists()
+        assert "# Protected" in (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        assert not (skill_dir / "references" / "new.md").exists()
+        assert support_file.exists()
+
+    def test_hub_installed_skill_mutations_are_refused(self, tmp_path):
+        name = "hub-skill"
+        skill_dir = _write_named_skill(tmp_path, name)
+        self._mark_hub(tmp_path, name)
+
+        with _skill_dir(tmp_path):
+            result = _patch_skill(name, "OLD_MARKER", "NEW_MARKER")
+
+        assert result["success"] is False, result
+        assert "protected skill" in result["error"].lower()
+        assert "OLD_MARKER" in (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+
+    def test_untracked_skill_still_mutable(self, tmp_path):
+        name = "local-skill"
+        skill_dir = _write_named_skill(tmp_path, name)
+
+        with _skill_dir(tmp_path):
+            result = _patch_skill(name, "OLD_MARKER", "NEW_MARKER")
+
+        assert result["success"] is True, result
+        assert "NEW_MARKER" in (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+
+
 
 # ---------------------------------------------------------------------------
 # Pinned-skill guard — skill_manage refuses only `delete` on pinned skills.

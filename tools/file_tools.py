@@ -156,11 +156,21 @@ _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
 
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
-    """Return an error message if the path targets a sensitive system location."""
+    """Return an error message if the path targets a protected or sensitive location."""
     try:
         resolved = str(_resolve_path_for_task(filepath, task_id))
     except (OSError, ValueError):
         resolved = filepath
+
+    try:
+        from agent.file_safety import get_protected_skill_write_error
+
+        protected_err = get_protected_skill_write_error(resolved, action="write")
+    except Exception:
+        protected_err = None
+    if protected_err:
+        return protected_err
+
     normalized = os.path.normpath(os.path.expanduser(filepath))
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
@@ -203,6 +213,21 @@ def _check_cross_profile_path(filepath: str, task_id: str = "default") -> str | 
         resolved = filepath
 
     return get_cross_profile_warning(resolved)
+
+
+def _check_protected_skill_path(filepath: str, task_id: str = "default", action: str = "write") -> str | None:
+    """Return a hard refusal when ``filepath`` targets an upstream-managed skill."""
+    try:
+        from agent.protected_skills import protected_skill_path_block_message
+    except Exception:
+        return None
+
+    try:
+        resolved = str(_resolve_path_for_task(filepath, task_id))
+    except (OSError, ValueError):
+        resolved = filepath
+
+    return protected_skill_path_block_message(resolved, action=action)
 
 
 def _is_expected_write_exception(exc: Exception) -> bool:
@@ -836,6 +861,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     Pass ``True`` after explicit user direction — same shape as ``force``
     on the terminal tool.
     """
+    protected_err = _check_protected_skill_path(path, task_id, action="write")
+    if protected_err:
+        return tool_error(protected_err)
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
@@ -843,6 +871,22 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
             return tool_error(cross_warning)
+    try:
+        resolved_for_content = str(_resolve_path_for_task(path, task_id))
+    except (OSError, ValueError):
+        resolved_for_content = path
+    try:
+        from agent.file_safety import get_protected_skill_content_error
+
+        content_err = get_protected_skill_content_error(
+            resolved_for_content,
+            content,
+            action="write",
+        )
+    except Exception:
+        content_err = None
+    if content_err:
+        return tool_error(content_err)
     if _is_internal_file_status_text(content):
         return tool_error(
             "Refusing to write internal read_file status text as file content. "
@@ -913,6 +957,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         for _m in _re.finditer(r'^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$', patch, _re.MULTILINE):
             _paths_to_check.append(_m.group(1).strip())
     for _p in _paths_to_check:
+        protected_err = _check_protected_skill_path(_p, task_id, action="patch")
+        if protected_err:
+            return tool_error(protected_err)
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)

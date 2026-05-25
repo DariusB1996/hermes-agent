@@ -1073,6 +1073,27 @@ def check_all_command_guards(command: str, env_type: str,
                        sudo_guess_desc, command[:200])
         return _sudo_stdin_block_result(sudo_guess_desc)
 
+    # Protected-skill floor: normal terminal approval/yolo settings must not
+    # bypass upstream skill governance. This is best-effort path detection for
+    # obvious shell writes/deletes and complements file/skill tool guards.
+    protected_skill_desc = None
+    protected_skill_result = None
+    try:
+        from agent.protected_skills import (
+            detect_protected_skill_command,
+            protected_skill_command_block_result,
+        )
+
+        protected_skill_desc = detect_protected_skill_command(command)
+        if protected_skill_desc:
+            protected_skill_result = protected_skill_command_block_result(protected_skill_desc)
+    except Exception:
+        protected_skill_desc = None
+        protected_skill_result = None
+    if protected_skill_result is not None:
+        logger.warning("Protected skill command block: %s (command: %s)", protected_skill_desc, command[:200])
+        return protected_skill_result
+
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()

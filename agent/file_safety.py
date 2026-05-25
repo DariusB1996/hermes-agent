@@ -6,6 +6,13 @@ import os
 from pathlib import Path
 from typing import Optional
 
+from agent.protected_skills import (
+    classify_protected_skill_name,
+    classify_protected_skill_path,
+    protected_skill_content_block_message,
+    protected_skill_path_block_message,
+)
+
 
 def _hermes_home_path() -> Path:
     """Resolve the active HERMES_HOME (profile-aware) without circular imports."""
@@ -93,6 +100,44 @@ def get_safe_write_root() -> Optional[str]:
         return None
 
 
+def classify_protected_skill_target(path: str) -> Optional[dict]:
+    """Return protected-skill metadata when *path* targets an upstream skill."""
+    try:
+        from agent.protected_skills import classify_protected_skill_path
+
+        match = classify_protected_skill_path(path)
+    except Exception:
+        return None
+    if match is None:
+        return None
+    return {
+        "skill_name": match.name,
+        "source": match.source,
+        "skill_dir": str(match.skill_dir) if match.skill_dir else None,
+        "skills_root": str(match.skills_root) if match.skills_root else None,
+    }
+
+
+def get_protected_skill_write_error(path: str, action: str = "write") -> Optional[str]:
+    """Return a refusal message if *path* targets a protected skill."""
+    try:
+        return protected_skill_path_block_message(path, action=action)
+    except Exception:
+        return None
+
+
+def get_protected_skill_content_error(
+    path: str,
+    content: str,
+    action: str = "write",
+) -> Optional[str]:
+    """Return a refusal message when SKILL.md content shadows a protected name."""
+    try:
+        return protected_skill_content_block_message(path, content, action=action)
+    except Exception:
+        return None
+
+
 def is_write_denied(path: str) -> bool:
     """Return True if path is blocked by the write denylist or safe root."""
     home = os.path.realpath(os.path.expanduser("~"))
@@ -140,6 +185,9 @@ def is_write_denied(path: str) -> bool:
                 return True
         except Exception:
             pass
+
+    if get_protected_skill_write_error(resolved):
+        return True
 
     safe_root = get_safe_write_root()
     if safe_root and not (resolved == safe_root or resolved.startswith(safe_root + os.sep)):

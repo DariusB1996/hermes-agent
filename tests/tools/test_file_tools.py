@@ -69,6 +69,18 @@ class TestReadFileHandler:
 
 
 class TestWriteFileHandler:
+    @staticmethod
+    def _protected_skill(tmp_path):
+        skills_root = tmp_path / "skills"
+        skill_dir = skills_root / "bundled-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: bundled-skill\ndescription: Bundled.\n---\n\n# Bundled\n",
+            encoding="utf-8",
+        )
+        (skills_root / ".bundled_manifest").write_text("bundled-skill:abc123\n", encoding="utf-8")
+        return skill_dir
+
     @patch("tools.file_tools._get_file_ops")
     def test_writes_content(self, mock_get):
         mock_ops = MagicMock()
@@ -81,6 +93,17 @@ class TestWriteFileHandler:
         result = json.loads(write_file_tool("/tmp/out.txt", "hello world!\n"))
         assert result["status"] == "ok"
         mock_ops.write_file.assert_called_once_with("/tmp/out.txt", "hello world!\n")
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_protected_skill_write_blocked_before_backend(self, mock_get, tmp_path):
+        skill_dir = self._protected_skill(tmp_path)
+
+        from tools.file_tools import write_file_tool
+        result = json.loads(write_file_tool(str(skill_dir / "SKILL.md"), "mutated"))
+
+        assert "error" in result
+        assert "protected skill" in result["error"].lower()
+        mock_get.assert_not_called()
 
     @patch("tools.file_tools._get_file_ops")
     def test_permission_error_returns_error_json_without_error_log(self, mock_get, caplog):
@@ -144,6 +167,18 @@ class TestWriteFileHandler:
 
 
 class TestPatchHandler:
+    @staticmethod
+    def _protected_skill(tmp_path):
+        skills_root = tmp_path / "skills"
+        skill_dir = skills_root / "bundled-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: bundled-skill\ndescription: Bundled.\n---\n\n# Bundled\n",
+            encoding="utf-8",
+        )
+        (skills_root / ".bundled_manifest").write_text("bundled-skill:abc123\n", encoding="utf-8")
+        return skill_dir
+
     @patch("tools.file_tools._get_file_ops")
     def test_replace_mode_calls_patch_replace(self, mock_get):
         mock_ops = MagicMock()
@@ -172,6 +207,41 @@ class TestPatchHandler:
         patch_tool(mode="replace", path="/tmp/f.py",
                    old_string="x", new_string="y", replace_all=True)
         mock_ops.patch_replace.assert_called_once_with("/tmp/f.py", "x", "y", True)
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_replace_mode_blocks_protected_skill_before_backend(self, mock_get, tmp_path):
+        skill_dir = self._protected_skill(tmp_path)
+
+        from tools.file_tools import patch_tool
+        result = json.loads(patch_tool(
+            mode="replace",
+            path=str(skill_dir / "SKILL.md"),
+            old_string="# Bundled",
+            new_string="# Mutated",
+        ))
+
+        assert "error" in result
+        assert "protected skill" in result["error"].lower()
+        mock_get.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_patch_mode_blocks_protected_skill_before_backend(self, mock_get, tmp_path):
+        skill_dir = self._protected_skill(tmp_path)
+        patch_text = (
+            "*** Begin Patch\n"
+            f"*** Update File: {skill_dir / 'SKILL.md'}\n"
+            "@@\n"
+            "-# Bundled\n"
+            "+# Mutated\n"
+            "*** End Patch\n"
+        )
+
+        from tools.file_tools import patch_tool
+        result = json.loads(patch_tool(mode="patch", patch=patch_text))
+
+        assert "error" in result
+        assert "protected skill" in result["error"].lower()
+        mock_get.assert_not_called()
 
     @patch("tools.file_tools._get_file_ops")
     def test_replace_mode_missing_path_errors(self, mock_get):

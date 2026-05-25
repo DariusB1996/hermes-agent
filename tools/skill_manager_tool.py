@@ -4,8 +4,9 @@ Skill Manager Tool -- Agent-Managed Skill Creation & Editing
 
 Allows the agent to create, update, and delete skills, turning successful
 approaches into reusable procedural knowledge. New skills are created in
-~/.hermes/skills/. Existing skills (bundled, hub-installed, or user-created)
-can be modified or deleted wherever they live.
+~/.hermes/skills/. User-created skills can be modified wherever they live;
+bundled/default and Hub-installed skills are upstream-managed and read-only to
+normal agent mutation paths.
 
 Skills are the agent's procedural memory: they capture *how to do a specific
 type of task* based on proven experience. General memory (MEMORY.md, USER.md) is
@@ -437,6 +438,40 @@ def _resolve_skill_target(skill_dir: Path, file_path: str) -> Tuple[Optional[Pat
     return target, None
 
 
+def _protected_skill_name_error(name: str, action: str, skills_root: Optional[Path] = None) -> Optional[str]:
+    """Return a protected-skill refusal for name-level mutations."""
+    try:
+        from agent.protected_skills import protected_skill_name_block_message
+
+        return protected_skill_name_block_message(name, action=action, skills_root=skills_root)
+    except Exception:
+        logger.debug("protected skill name guard failed for %s", name, exc_info=True)
+        return None
+
+
+def _protected_skill_path_error(path: Path, action: str) -> Optional[str]:
+    """Return a protected-skill refusal for path-level mutations."""
+    try:
+        from agent.protected_skills import protected_skill_path_block_message
+
+        return protected_skill_path_block_message(path, action=action)
+    except Exception:
+        logger.debug("protected skill path guard failed for %s", path, exc_info=True)
+        return None
+
+
+def _protected_existing_skill_error(skill_dir: Path, action: str) -> Optional[str]:
+    """Return a protected-skill refusal for an already located skill dir."""
+    return _protected_skill_path_error(
+        skill_dir / "SKILL.md",
+        action=action,
+    ) or _protected_skill_name_error(
+        skill_dir.name,
+        action=action,
+        skills_root=_containing_skills_root(skill_dir),
+    )
+
+
 def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -> None:
     """
     Atomically write text content to a file.
@@ -493,9 +528,16 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     if err:
         return {"success": False, "error": err}
 
+    protected_err = _protected_skill_name_error(name, "create", skills_root=SKILLS_DIR)
+    if protected_err:
+        return {"success": False, "error": protected_err}
+
     # Check for name collisions across all directories
     existing = _find_skill(name)
     if existing:
+        protected_err = _protected_existing_skill_error(existing["path"], "create/shadow")
+        if protected_err:
+            return {"success": False, "error": protected_err}
         return {
             "success": False,
             "error": f"A skill named '{name}' already exists at {existing['path']}."
@@ -543,6 +585,10 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+
+    protected_err = _protected_existing_skill_error(existing["path"], "edit")
+    if protected_err:
+        return {"success": False, "error": protected_err}
 
     skill_md = existing["path"] / "SKILL.md"
     # Back up original content for rollback
@@ -597,6 +643,11 @@ def _patch_skill(
     else:
         # Patching SKILL.md
         target = skill_dir / "SKILL.md"
+
+    assert target is not None
+    protected_err = _protected_skill_path_error(target, "patch") or _protected_existing_skill_error(skill_dir, "patch")
+    if protected_err:
+        return {"success": False, "error": protected_err}
 
     if not target.exists():
         return {"success": False, "error": f"File not found: {target.relative_to(skill_dir)}"}
@@ -673,6 +724,10 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
 
+    protected_err = _protected_existing_skill_error(existing["path"], "delete")
+    if protected_err:
+        return {"success": False, "error": protected_err}
+
     pinned_err = _pinned_guard(name)
     if pinned_err:
         return {"success": False, "error": pinned_err}
@@ -745,6 +800,12 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     target, err = _resolve_skill_target(existing["path"], file_path)
     if err:
         return {"success": False, "error": err}
+
+    assert target is not None
+    protected_err = _protected_skill_path_error(target, "write_file") or _protected_existing_skill_error(existing["path"], "write_file")
+    if protected_err:
+        return {"success": False, "error": protected_err}
+
     target.parent.mkdir(parents=True, exist_ok=True)
     # Back up for rollback
     original_content = target.read_text(encoding="utf-8") if target.exists() else None
@@ -781,6 +842,12 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     target, err = _resolve_skill_target(skill_dir, file_path)
     if err:
         return {"success": False, "error": err}
+
+    assert target is not None
+    protected_err = _protected_skill_path_error(target, "remove_file") or _protected_existing_skill_error(skill_dir, "remove_file")
+    if protected_err:
+        return {"success": False, "error": protected_err}
+
     if not target.exists():
         # List what's actually there for the model to see
         available = []
@@ -902,7 +969,7 @@ SKILL_MANAGE_SCHEMA = {
     "description": (
         "Manage skills (create, update, delete). Skills are your procedural "
         "memory — reusable approaches for recurring task types. "
-        f"New skills go to {display_hermes_home()}/skills/; existing skills can be modified wherever they live.\n\n"
+        f"New skills go to {display_hermes_home()}/skills/; user-created existing skills can be modified wherever they live. Bundled/default and Hub-installed skills are protected read-only upstream artifacts.\n\n"
         "Actions: create (full SKILL.md + optional category), "
         "patch (old_string/new_string — preferred for fixes), "
         "edit (full SKILL.md rewrite — major overhauls only), "

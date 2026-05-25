@@ -54,6 +54,49 @@ class TestIsWriteDenied:
         path = str(tmp_path / "safe_file.txt")
         assert _is_write_denied(path) is False
 
+    def test_bundled_skill_tree_denied_from_manifest(self, tmp_path):
+        """Any file under a bundled/default skill is protected from direct writes."""
+        skills_root = tmp_path / "skills"
+        skill_dir = skills_root / "devops" / "bundled-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: bundled-skill\ndescription: Bundled.\n---\n\n# Bundled\n",
+            encoding="utf-8",
+        )
+        (skills_root / ".bundled_manifest").write_text("bundled-skill:abc123\n", encoding="utf-8")
+
+        assert _is_write_denied(str(skill_dir / "SKILL.md")) is True
+        assert _is_write_denied(str(skill_dir / "references" / "notes.md")) is True
+
+    def test_hub_installed_skill_tree_denied_from_lock(self, tmp_path):
+        """Hub lock provenance makes the installed skill tree read-only to file tools."""
+        skills_root = tmp_path / "skills"
+        skill_dir = skills_root / "hub-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: hub-skill\ndescription: Hub.\n---\n\n# Hub\n",
+            encoding="utf-8",
+        )
+        hub_dir = skills_root / ".hub"
+        hub_dir.mkdir()
+        (hub_dir / "lock.json").write_text(
+            '{"version": 1, "installed": {"hub-skill": {"install_path": "hub-skill"}}}\n',
+            encoding="utf-8",
+        )
+
+        assert _is_write_denied(str(skill_dir / "SKILL.md")) is True
+
+    def test_untracked_skill_tree_still_allowed(self, tmp_path):
+        skills_root = tmp_path / "skills"
+        skill_dir = skills_root / "local-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: local-skill\ndescription: Local.\n---\n\n# Local\n",
+            encoding="utf-8",
+        )
+
+        assert _is_write_denied(str(skill_dir / "SKILL.md")) is False
+
     def test_project_file_allowed(self):
         assert _is_write_denied("/tmp/project/main.py") is False
 
